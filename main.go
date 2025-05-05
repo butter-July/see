@@ -8,25 +8,15 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
-	"syscall"
 	"time"
-	"unsafe"
 )
 
-// 定义Windows API常量
-const (
-	PROCESS_VM_READ           = 0x0010
-	PROCESS_QUERY_INFORMATION = 0x0400
-)
-
-// Config 结构体定义
 type Config struct {
 	Username        string
 	Port            int
 	RefreshInterval int
 }
 
-// 默认配置
 var config = Config{
 	Username:        "zz",
 	Port:            8080,
@@ -57,147 +47,12 @@ func (us *UserStatus) GetStatus() (string, string, string) {
 	defer us.mutex.RUnlock()
 	return us.Username, us.UsingApp, us.Timestamp
 }
-
-// Windows API 函数
-var (
-	modUser32                    = syscall.NewLazyDLL("user32.dll")
-	procGetForegroundWindow      = modUser32.NewProc("GetForegroundWindow")
-	procGetWindowTextLengthW     = modUser32.NewProc("GetWindowTextLengthW")
-	procGetWindowTextW           = modUser32.NewProc("GetWindowTextW")
-	procGetWindowThreadProcessId = modUser32.NewProc("GetWindowThreadProcessId")
-
-	modKernel32              = syscall.NewLazyDLL("kernel32.dll")
-	procGetModuleFileNameExW = modKernel32.NewProc("GetModuleFileNameExW")
-
-	modPsapi                     = syscall.NewLazyDLL("psapi.dll")
-	procGetProcessImageFileNameW = modPsapi.NewProc("GetProcessImageFileNameW")
-)
-
-// 获取前台窗口句柄
-func getForegroundWindow() uintptr {
-	ret, _, _ := procGetForegroundWindow.Call()
-	return ret
-}
-
-// 获取窗口标题长度
-func getWindowTextLength(hwnd uintptr) int {
-	ret, _, _ := procGetWindowTextLengthW.Call(hwnd)
-	return int(ret)
-}
-
-// 获取窗口标题
-func getWindowText(hwnd uintptr, str *uint16, maxCount int) int {
-	ret, _, _ := procGetWindowTextW.Call(
-		hwnd,
-		uintptr(unsafe.Pointer(str)),
-		uintptr(maxCount))
-	return int(ret)
-}
-
-// 获取窗口所属进程ID
-func getWindowThreadProcessId(hwnd uintptr, pid *uint32) uint32 {
-	ret, _, _ := procGetWindowThreadProcessId.Call(
-		hwnd,
-		uintptr(unsafe.Pointer(pid)))
-	return uint32(ret)
-}
-
-func getProcessImageFileName(handle syscall.Handle, outPath *uint16, size uint32) (err error) {
-	r1, _, e1 := procGetProcessImageFileNameW.Call(
-		uintptr(handle),
-		uintptr(unsafe.Pointer(outPath)),
-		uintptr(size),
-	)
-	if r1 == 0 {
-		if e1 != nil {
-			err = error(e1)
-		} else {
-			err = syscall.EINVAL
-		}
-	}
-	return
-}
-
-func getForegroundWindowInfo() string {
-	hwnd := getForegroundWindow()
-	if hwnd == 0 {
-		return "Unknown"
-	}
-
-	// 获取窗口标题
-	length := getWindowTextLength(hwnd) + 1
-	buf := make([]uint16, length)
-	getWindowText(hwnd, &buf[0], length)
-	windowTitle := syscall.UTF16ToString(buf)
-
-	// 获取进程ID
-	var pid uint32
-	getWindowThreadProcessId(hwnd, &pid)
-
-	// 打开进程
-	handle, err := syscall.OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ, false, pid)
-	if err != nil {
-		return windowTitle
-	}
-	defer syscall.CloseHandle(handle)
-
-	// 获取进程可执行文件路径
-	var exePath [syscall.MAX_PATH]uint16
-	err = getProcessImageFileName(handle, &exePath[0], syscall.MAX_PATH)
-	if err != nil {
-		return windowTitle
-	}
-
-	// 从路径中提取文件名
-	exeName := syscall.UTF16ToString(exePath[:])
-	for i := len(exeName) - 1; i >= 0; i-- {
-		if exeName[i] == '\\' {
-			exeName = exeName[i+1:]
-			break
-		}
-	}
-
-	// 如果能获取到可执行文件名，返回它，否则返回窗口标题
-	if exeName != "" {
-		// 去掉扩展名
-		for i := len(exeName) - 1; i >= 0; i-- {
-			if exeName[i] == '.' {
-				exeName = exeName[:i]
-				break
-			}
-		}
-		return exeName
-	}
-	return windowTitle
-}
-
-func monitorActiveApplication() {
+func monitorApplication() {
 	for {
 		appName := getForegroundWindowInfo()
 		currentStatus.UpdateStatus(appName)
 		time.Sleep(time.Duration(config.RefreshInterval) * time.Millisecond)
 	}
-}
-
-func main() {
-	// 启动应用程序监控
-	go monitorActiveApplication()
-
-	// 设置路由
-	http.HandleFunc("/", handleHome)
-	http.HandleFunc("/api/status", handleStatusAPI)
-
-	// 启动服务器
-	port := config.Port
-	fmt.Printf("服务器启动在 http://localhost:%d\n", port)
-
-	// 自动打开浏览器
-	go func() {
-		time.Sleep(1 * time.Second)
-		openBrowser(fmt.Sprintf("http://localhost:%d", port))
-	}()
-
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
 }
 
 func openBrowser(url string) {
@@ -207,13 +62,12 @@ func openBrowser(url string) {
 		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
 	case "darwin":
 		err = exec.Command("open", url).Start()
-	case "linux":
-		err = exec.Command("xdg-open", url).Start()
 	default:
-		err = fmt.Errorf("不支持的操作系统")
+		// Linux服务器通常没有GUI，不尝试打开浏览器
+		return
 	}
 	if err != nil {
-		log.Printf("无法打开浏览器: %v", err)
+		log.Printf("Failed to open browser: %v", err)
 	}
 }
 
@@ -227,8 +81,7 @@ func handleStatusAPI(w http.ResponseWriter, r *http.Request) {
 func handleHome(w http.ResponseWriter, r *http.Request) {
 	username, app, _ := currentStatus.GetStatus()
 
-	tmpl := `	
-<!DOCTYPE html>
+	tmpl := `<!DOCTYPE html>
 <html>
 <head>
     <title>What's {{.Username}} doing now?</title>
@@ -284,8 +137,7 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
         </div>
     </div>
 </body>
-</html>
-`
+</html>`
 
 	t, err := template.New("home").Parse(tmpl)
 	if err != nil {
@@ -307,4 +159,29 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+func main() {
+	// 启动应用监控
+	go monitorApplication()
+
+	// 设置路由
+	http.HandleFunc("/", handleHome)
+	http.HandleFunc("/api/status", handleStatusAPI)
+
+	// 启动服务器
+	port := config.Port
+	serverAddr := fmt.Sprintf(":%d", port)
+	fmt.Printf("Server starting on http://0.0.0.0%s\n", serverAddr)
+
+	// 仅Windows平台尝试打开浏览器
+	if runtime.GOOS == "windows" {
+		go func() {
+			time.Sleep(1 * time.Second)
+			openBrowser(fmt.Sprintf("http://localhost%s", serverAddr))
+		}()
+	}
+
+	// 启动HTTP服务
+	log.Fatal(http.ListenAndServe(serverAddr, nil))
 }
